@@ -5,7 +5,38 @@ from datetime import datetime, timedelta
 
 import requests
 
-SUBREDDITS = [
+# Reddit subreddit naming rules:
+# - 3 to 21 characters long
+# - Only alphanumeric characters and underscores
+# - Cannot start with an underscore
+_SUBREDDIT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]{2,20}$")
+
+
+def validate_subreddits(subreddits: list[str]) -> list[str]:
+    """Validate a list of subreddit names against Reddit's naming rules.
+
+    Returns the list unchanged if all names are valid.
+    Raises ValueError if any name is invalid.
+    """
+    if not subreddits:
+        raise ValueError("SUBREDDITS list must not be empty")
+
+    invalid = []
+    for name in subreddits:
+        if not isinstance(name, str) or not _SUBREDDIT_NAME_PATTERN.match(name):
+            invalid.append(name)
+
+    if invalid:
+        raise ValueError(
+            f"Invalid subreddit name(s): {invalid}. "
+            "Subreddit names must be 3-21 characters, alphanumeric or "
+            "underscores, and cannot start with an underscore."
+        )
+
+    return subreddits
+
+
+SUBREDDITS = validate_subreddits([
     "wallstreetbets",
     "stocks",
     "investing",
@@ -13,7 +44,7 @@ SUBREDDITS = [
     "StockMarket",
     "thetagang",
     "dividends",
-]
+])
 
 COMMON_FALSE_TICKERS = {
     "A", "I", "DD", "CEO", "CFO", "CTA", "ETF", "AI", "IPO", "YOLO",
