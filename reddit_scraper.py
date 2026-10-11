@@ -1,42 +1,16 @@
 import re
 import time
+import json
+import os
 from collections import Counter
 from datetime import datetime, timedelta
 
 import requests
 
-# Reddit subreddit naming rules:
-# - 3 to 21 characters long
-# - Only alphanumeric characters and underscores
-# - Cannot start with an underscore
-_SUBREDDIT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]{2,20}$")
+CACHE_FILE = "trend_cache.json"
+CACHE_TTL_HOURS = 6
 
-
-def validate_subreddits(subreddits: list[str]) -> list[str]:
-    """Validate a list of subreddit names against Reddit's naming rules.
-
-    Returns the list unchanged if all names are valid.
-    Raises ValueError if any name is invalid.
-    """
-    if not subreddits:
-        raise ValueError("SUBREDDITS list must not be empty")
-
-    invalid = []
-    for name in subreddits:
-        if not isinstance(name, str) or not _SUBREDDIT_NAME_PATTERN.match(name):
-            invalid.append(name)
-
-    if invalid:
-        raise ValueError(
-            f"Invalid subreddit name(s): {invalid}. "
-            "Subreddit names must be 3-21 characters, alphanumeric or "
-            "underscores, and cannot start with an underscore."
-        )
-
-    return subreddits
-
-
-SUBREDDITS = validate_subreddits([
+SUBREDDITS = [
     "wallstreetbets",
     "stocks",
     "investing",
@@ -141,6 +115,104 @@ def scrape_subreddit(subreddit: str, limit: int = 50) -> list[dict]:
     return posts
 
 
+def compute_trends(current_counts: dict, prior_counts: dict) -> dict[str, str]:
+    trends: dict[str, str] = {}
+    all_tickers = set(current_counts.keys()) | set(prior_counts.keys())
+
+    for ticker in all_tickers:
+        curr = current_counts.get(ticker, 0)
+        prior = prior_counts.get(ticker, 0)
+        if curr > prior * 1.5:
+            trends[ticker] = "rising"
+        elif prior > curr * 1.5:
+            trends[ticker] = "falling"
+        elif curr > 0 and prior == 0:
+            trends[ticker] = "new"
+        elif curr > 0:
+            trends[ticker] = "steady"
+        else:
+            trends[ticker] = "gone"
+
+    return trends
+
+
+def scrape_prior_week(subreddit: str, limit: int = 50) -> list[dict]:
+    """Scrape posts from 7-14 days ago for trend comparison."""
+    url = f"https://www.reddit.com/r/{subreddit}/top.json"
+    headers = {"User-Agent": USER_AGENT}
+    params: dict = {"limit": limit, "t": "month"}
+
+    posts: list[dict] = []
+    cutoff_old = datetime.utcnow() - timedelta(days=14)
+    cutoff_new = datetime.utcnow() - timedelta(days=7)
+    fetched = 0
+
+    while fetched < limit:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code != 200:
+            break
+        data = resp.json()
+        children = data.get("data", {}).get("children", [])
+        if not children:
+            break
+        for child in children:
+            post_data = child["data"]
+            created = _parse_utc(post_data["created_utc"])
+            if cutoff_old <= created <= cutoff_new:
+                posts.append({
+                    "subreddit": subreddit,
+                    "title": post_data.get("title", ""),
+                    "selftext": post_data.get("selftext", ""),
+                    "created": created.isoformat(),
+                })
+                fetched += 1
+            if fetched >= limit:
+                break
+        after = data.get("data", {}).get("after")
+        if not after:
+            break
+        params["after"] = after
+        time.sleep(1.0)
+    return posts
+
+
+def _load_trend_cache() -> tuple[dict, float]:
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE) as f:
+                data = json.load(f)
+            return data.get("counts", {}), data.get("ts", 0)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return {}, 0
+
+
+def _save_trend_cache(counter: Counter):
+    with open(CACHE_FILE, "w") as f:
+        json.dump({"counts": dict(counter), "ts": time.time()}, f)
+
+
+def scrape_prior_period(limit_per_sub: int = 50) -> Counter:
+    cached_counts, cached_ts = _load_trend_cache()
+    if cached_counts and (time.time() - cached_ts) < CACHE_TTL_HOURS * 3600:
+        print(f"\n  Using cached trend data ({len(cached_counts)} tickers)")
+        return Counter(cached_counts)
+
+    counter: Counter = Counter()
+    for sub in SUBREDDITS:
+        print(f"  r/{sub} (prior week)...", end=" ", flush=True)
+        posts = scrape_prior_week(sub, limit=limit_per_sub)
+        print(f"{len(posts)} posts")
+        for post in posts:
+            full_text = f"{post['title']} {post['selftext']}"
+            for t in set(extract_tickers(full_text)):
+                counter[t] += 1
+        time.sleep(1.5)
+
+    _save_trend_cache(counter)
+    return counter
+
+
 def scrape_all(limit_per_sub: int = 50) -> dict:
     print(f"\nScraping {len(SUBREDDITS)} subreddits "
           f"(~{limit_per_sub} posts each)...\n")
@@ -174,8 +246,18 @@ def scrape_all(limit_per_sub: int = 50) -> dict:
     for ticker, count in ranked[:15]:
         print(f"  ${ticker}: {count} mentions")
 
+    print("\nCollecting prior week data for trend comparison...")
+    prior_counter = scrape_prior_period(limit_per_sub=limit_per_sub)
+    trends = compute_trends(ticker_counter, prior_counter)
+
+    rising = [t for t, tr in trends.items() if tr == "rising"]
+    falling = [t for t, tr in trends.items() if tr == "falling"]
+    new = [t for t, tr in trends.items() if tr == "new"]
+    print(f"  Rising: {len(rising)}, Falling: {len(falling)}, New: {len(new)}")
+
     return {
         "posts": all_posts,
         "ticker_counts": dict(ranked),
         "ticker_posts": ticker_posts,
+        "trends": trends,
     }

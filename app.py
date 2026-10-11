@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from reddit_scraper import scrape_all
 from stock_data import fetch_stock_data, find_european_equivalents
+from backtest import save_pick, compute_performance
 
 load_dotenv()
 
@@ -37,15 +38,26 @@ def extract_top_picks(analysis: str) -> list[str]:
     return picks
 
 
+def parse_confidence(analysis: str) -> int:
+    m = re.search(r"Confidence Score:\s*(\d+)/10", analysis, re.IGNORECASE)
+    return int(m.group(1)) if m else 0
+
+
+def parse_top_ticker_price(ticker: str, stock_data: dict) -> float:
+    sd = stock_data.get(ticker, {})
+    return sd.get("price", 0)
+
+
 def build_context(reddit_data: dict, stock_data: dict, euro: bool = False) -> str:
     ticker_counts = reddit_data["ticker_counts"]
     top_tickers = list(ticker_counts.keys())[:TOP_N_TICKERS]
+    trends = reddit_data.get("trends", {})
 
     lines = [
         f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
         f"Total Reddit Posts Analyzed: {len(reddit_data['posts'])}",
         "",
-        "=== STOCK DATA ===",
+        "=== STOCK DATA (with MOMENTUM TREND) ===",
     ]
 
     for ticker in top_tickers:
@@ -53,6 +65,7 @@ def build_context(reddit_data: dict, stock_data: dict, euro: bool = False) -> st
         if not sd:
             continue
         mentions = ticker_counts.get(ticker, 0)
+        trend = trends.get(ticker, "steady")
         cap_str = f"${sd['market_cap']/1e9:.1f}B" if sd["market_cap"] else "N/A"
         target_str = f"${sd['target_mean']:.2f}" if sd.get("target_mean") else "N/A"
         short_str = f"{sd['short_pct']*100:.1f}%" if sd.get("short_pct") else "N/A"
@@ -71,14 +84,24 @@ def build_context(reddit_data: dict, stock_data: dict, euro: bool = False) -> st
             f"Recommendation={sd['recommendation']}, "
             f"AnalystTarget={target_str}, "
             f"ShortFloat={short_str}, "
+            f"InstOwnership={sd.get('inst_ownership', 'N/A')}, "
             f"VolRatio={sd['volume_ratio']}, "
-            f"RedditMentions={mentions}"
+            f"RedditMentions={mentions}, "
+            f"MentionsTrend={trend} (rising=accelerating hype, falling=fading interest, new=first appearance, steady=same level)"
         )
+
+    trending_up = [t for t in top_tickers if trends.get(t) == "rising"]
+    trending_down = [t for t in top_tickers if trends.get(t) == "falling"]
+    if trending_up:
+        lines.append(f"\nRISING mentions (more hype this week vs last): {', '.join('$'+t for t in trending_up)}")
+    if trending_down:
+        lines.append(f"FALLING mentions (less hype this week vs last): {', '.join('$'+t for t in trending_down)}")
 
     lines.append("")
     lines.append("=== REDDIT MENTION RANKING ===")
     for ticker, count in list(ticker_counts.items())[:TOP_N_TICKERS]:
-        lines.append(f"  ${ticker}: {count} mentions")
+        trend_icon = {"rising": "↑", "falling": "↓", "new": "★", "steady": "→", "gone": "✗"}.get(trends.get(ticker, ""), "")
+        lines.append(f"  ${ticker}: {count} mentions {trend_icon}")
 
     if euro:
         lines.append("")
@@ -94,7 +117,11 @@ async def run_analysis(context: str) -> str:
         "Your specialty is combining social media sentiment analysis with "
         "fundamental and technical data to identify short-term trading opportunities. "
         "Output your analysis in clear sections with specific reasoning. "
-        "Be concise and data-driven."
+        "Be concise and data-driven.\n\n"
+        "CRITICAL: A stock with RISING mentions + strong fundamentals is a buy signal. "
+        "A stock with FALLING mentions (fading hype) is a sell signal — do NOT pick these. "
+        "A stock with RISING mentions but weak fundamentals is a hype trap — be skeptical. "
+        "Weight fundamentals (P/E, beta, analyst consensus) at least as heavily as Reddit sentiment."
     )
 
     user_prompt = f"""Analyze the following data and determine which single stock has the highest probability of delivering the best return over the NEXT 7 DAYS (1 week).
@@ -147,60 +174,89 @@ DATA:
         return f"Error calling Deepseek API: {e}"
 
 
+async def send_event(msg_type: str, data: dict):
+    yield f"data: {json.dumps({'type': msg_type, **data})}\n\n"
+
+
 async def event_stream(posts_per_sub: int, euro: bool):
-    yield f"data: {json.dumps({'type': 'status', 'message': 'Scraping Reddit...'})}\n\n"
+    try:
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Scraping Reddit...'})}\n\n"
 
-    loop = asyncio.get_event_loop()
-    reddit_data = await loop.run_in_executor(None, lambda: scrape_all(limit_per_sub=posts_per_sub))
+        loop = asyncio.get_event_loop()
+        reddit_data = await loop.run_in_executor(None, lambda: scrape_all(limit_per_sub=posts_per_sub))
 
-    ticker_count = len(reddit_data["ticker_counts"])
-    yield f"data: {json.dumps({'type': 'status', 'message': f'Found {ticker_count} unique tickers. Fetching stock data...'})}\n\n"
+        ticker_count = len(reddit_data["ticker_counts"])
+        yield f"data: {json.dumps({'type': 'status', 'message': f'Found {ticker_count} unique tickers. Fetching stock data...'})}\n\n"
 
-    top_tickers = list(reddit_data["ticker_counts"].keys())[:TOP_N_TICKERS]
-    stock_data = await loop.run_in_executor(None, fetch_stock_data, top_tickers)
+        top_tickers = list(reddit_data["ticker_counts"].keys())[:TOP_N_TICKERS]
+        stock_data = await loop.run_in_executor(None, fetch_stock_data, top_tickers)
 
-    yield f"data: {json.dumps({'type': 'status', 'message': f'Stock data ready for {len(stock_data)} tickers. Sending to AI...'})}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'message': f'Stock data ready for {len(stock_data)} tickers. Sending to AI...'})}\n\n"
 
-    stock_rows = []
-    for ticker in list(reddit_data["ticker_counts"].keys())[:TOP_N_TICKERS]:
-        sd = stock_data.get(ticker)
-        if not sd:
-            continue
-        stock_rows.append({
-            "ticker": ticker,
-            "price": sd["price"],
-            "currency": sd["currency"],
-            "market_cap": sd["market_cap"],
-            "sector": sd["sector"],
-            "short_name": sd["short_name"],
-            "week_change_pct": sd["week_change_pct"],
-            "pe_ratio": sd.get("pe_ratio"),
-            "forward_pe": sd.get("forward_pe"),
-            "beta": sd.get("beta"),
-            "volume_ratio": sd["volume_ratio"],
+        stock_rows = []
+        for ticker in list(reddit_data["ticker_counts"].keys())[:TOP_N_TICKERS]:
+            sd = stock_data.get(ticker)
+            if not sd:
+                continue
+            stock_rows.append({
+                "ticker": ticker,
+                "price": sd["price"],
+                "currency": sd["currency"],
+                "market_cap": sd["market_cap"],
+                "sector": sd["sector"],
+                "short_name": sd["short_name"],
+                "week_change_pct": sd["week_change_pct"],
+                "pe_ratio": sd.get("pe_ratio"),
+                "forward_pe": sd.get("forward_pe"),
+                "beta": sd.get("beta"),
+                "volume_ratio": sd["volume_ratio"],
             "short_pct": sd.get("short_pct"),
+            "inst_ownership": sd.get("inst_ownership"),
             "recommendation": sd["recommendation"],
-            "target_mean": sd.get("target_mean"),
-            "mentions": reddit_data["ticker_counts"].get(ticker, 0),
-        })
+                "target_mean": sd.get("target_mean"),
+                "mentions": reddit_data["ticker_counts"].get(ticker, 0),
+                "trend": reddit_data.get("trends", {}).get(ticker, "steady"),
+            })
 
-    context = build_context(reddit_data, stock_data, euro=euro)
-    analysis = await run_analysis(context)
+        context = build_context(reddit_data, stock_data, euro=euro)
+        analysis = await run_analysis(context)
 
-    euro_data = []
-    if euro:
         picks = extract_top_picks(analysis)
-        for us_ticker in picks:
-            eq = await loop.run_in_executor(None, find_european_equivalents, us_ticker)
-            euro_data.append({"us_ticker": us_ticker, "equivalents": eq})
+        top_ticker = picks[0] if len(picks) > 0 else ""
+        runner_ticker = picks[1] if len(picks) > 1 else ""
+        wildcard_ticker = picks[2] if len(picks) > 2 else ""
 
-    yield f"data: {json.dumps({'type': 'result', 'stocks': stock_rows, 'analysis': analysis, 'euro': euro_data})}\n\n"
-    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        save_pick(
+            top_pick=top_ticker,
+            top_price=parse_top_ticker_price(top_ticker, stock_data),
+            runner_up=runner_ticker,
+            runner_up_price=parse_top_ticker_price(runner_ticker, stock_data),
+            wildcard=wildcard_ticker,
+            wildcard_price=parse_top_ticker_price(wildcard_ticker, stock_data),
+            confidence=parse_confidence(analysis),
+            posts_scraped=len(reddit_data["posts"]),
+            tickers_found=len(reddit_data["ticker_counts"]),
+            analysis=analysis,
+        )
+
+        euro_data = []
+        if euro:
+            picks = extract_top_picks(analysis)
+            for us_ticker in picks:
+                eq = await loop.run_in_executor(None, find_european_equivalents, us_ticker)
+                euro_data.append({"us_ticker": us_ticker, "equivalents": eq})
+
+        yield f"data: {json.dumps({'type': 'result', 'stocks': stock_rows, 'analysis': analysis, 'euro': euro_data})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
 @app.get("/api/analyze")
 async def analyze(
-    posts: int = Query(25, ge=5, le=100),
+    posts: int = Query(25, ge=10, le=25),
     euro: bool = Query(False),
 ):
     return StreamingResponse(
@@ -221,6 +277,17 @@ async def index():
 @app.get("/app")
 async def app_page():
     return HTMLResponse(open("static/app.html").read())
+
+
+@app.get("/track-record")
+async def track_record_page():
+    return HTMLResponse(open("static/track-record.html").read())
+
+
+@app.get("/api/track-record")
+async def track_record_api():
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, compute_performance)
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")

@@ -14,6 +14,7 @@ from rich.table import Table
 
 from reddit_scraper import scrape_all
 from stock_data import fetch_stock_data, find_european_equivalents
+from backtest import save_pick
 
 load_dotenv()
 
@@ -89,12 +90,13 @@ def print_euro_equivalents(analysis: str):
 def build_context(reddit_data: dict, stock_data: dict, euro: bool = False) -> str:
     ticker_counts = reddit_data["ticker_counts"]
     top_tickers = list(ticker_counts.keys())[:TOP_N_TICKERS]
+    trends = reddit_data.get("trends", {})
 
     lines = [
         f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}",
         f"Total Reddit Posts Analyzed: {len(reddit_data['posts'])}",
         "",
-        "=== STOCK DATA ===",
+        "=== STOCK DATA (with MOMENTUM TREND) ===",
     ]
 
     for ticker in top_tickers:
@@ -102,6 +104,7 @@ def build_context(reddit_data: dict, stock_data: dict, euro: bool = False) -> st
         if not sd:
             continue
         mentions = ticker_counts.get(ticker, 0)
+        trend = trends.get(ticker, "steady")
         cap_str = f"${sd['market_cap']/1e9:.1f}B" if sd["market_cap"] else "N/A"
         target_str = f"${sd['target_mean']:.2f}" if sd.get("target_mean") else "N/A"
         short_str = f"{sd['short_pct']*100:.1f}%" if sd.get("short_pct") else "N/A"
@@ -121,13 +124,22 @@ def build_context(reddit_data: dict, stock_data: dict, euro: bool = False) -> st
             f"AnalystTarget={target_str}, "
             f"ShortFloat={short_str}, "
             f"VolRatio={sd['volume_ratio']}, "
-            f"RedditMentions={mentions}"
+            f"RedditMentions={mentions}, "
+            f"MentionsTrend={trend}"
         )
+
+    trending_up = [t for t in top_tickers if trends.get(t) == "rising"]
+    trending_down = [t for t in top_tickers if trends.get(t) == "falling"]
+    if trending_up:
+        lines.append(f"\nRISING mentions: {', '.join('$'+t for t in trending_up)}")
+    if trending_down:
+        lines.append(f"FALLING mentions: {', '.join('$'+t for t in trending_down)}")
 
     lines.append("")
     lines.append("=== REDDIT MENTION RANKING ===")
     for ticker, count in list(ticker_counts.items())[:TOP_N_TICKERS]:
-        lines.append(f"  ${ticker}: {count} mentions")
+        trend_icon = {"rising": "↑", "falling": "↓", "new": "★"}.get(trends.get(ticker, ""), "")
+        lines.append(f"  ${ticker}: {count} mentions {trend_icon}")
 
     if euro:
         lines.append("")
@@ -144,8 +156,12 @@ def run_analysis(context: str) -> str:
         "You are a senior quantitative analyst at a top hedge fund. "
         "Your specialty is combining social media sentiment analysis with "
         "fundamental and technical data to identify short-term trading opportunities. "
-        "You are pragmatic, data-driven, and concise. "
-        "Output your analysis in clear sections with specific reasoning."
+        "Output your analysis in clear sections with specific reasoning. "
+        "Be concise and data-driven.\n\n"
+        "CRITICAL: Rising mentions + strong fundamentals = buy. "
+        "Falling mentions (fading hype) = avoid. "
+        "Rising mentions + weak fundamentals = hype trap. "
+        "Weight fundamentals at least as heavily as sentiment."
     )
 
     user_prompt = f"""Analyze the following data and determine which single stock has the highest probability of delivering the best return over the NEXT 7 DAYS (1 week).
@@ -278,6 +294,26 @@ def main():
 
     if args.euro:
         print_euro_equivalents(analysis)
+
+    picks = extract_top_picks(analysis)
+    top_ticker = picks[0] if len(picks) > 0 else ""
+    runner_ticker = picks[1] if len(picks) > 1 else ""
+    wildcard_ticker = picks[2] if len(picks) > 2 else ""
+    conf_match = re.search(r"Confidence Score:\s*(\d+)/10", analysis, re.IGNORECASE)
+    confidence = int(conf_match.group(1)) if conf_match else 0
+
+    save_pick(
+        top_pick=top_ticker,
+        top_price=stock_data.get(top_ticker, {}).get("price", 0),
+        runner_up=runner_ticker,
+        runner_up_price=stock_data.get(runner_ticker, {}).get("price", 0),
+        wildcard=wildcard_ticker,
+        wildcard_price=stock_data.get(wildcard_ticker, {}).get("price", 0),
+        confidence=confidence,
+        posts_scraped=len(reddit_data["posts"]),
+        tickers_found=len(reddit_data["ticker_counts"]),
+        analysis=analysis,
+    )
 
     disclaimer = (
         "DISCLAIMER: This is AI-generated analysis for entertainment/educational "
