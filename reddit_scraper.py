@@ -18,7 +18,7 @@ SUBREDDITS = [
     "StockMarket",
     "thetagang",
     "dividends",
-]
+])
 
 COMMON_FALSE_TICKERS = {
     "A", "I", "DD", "CEO", "CFO", "CTA", "ETF", "AI", "IPO", "YOLO",
